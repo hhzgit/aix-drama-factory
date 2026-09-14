@@ -116,6 +116,24 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(response.get_json()['queue_pending'], [])
         self.assertFalse(response.get_json()['ok'])
 
+    @patch.object(factory.time, 'monotonic', side_effect=[0.0, 11.0, 11.0])
+    def test_pipeline_sse_emits_heartbeat_while_worker_is_silent(self, _monotonic):
+        worker = Mock()
+        worker.is_alive.side_effect = [True, False]
+
+        frames = list(factory.stream_sse_queue(worker, [], poll_interval=0,
+                                               heartbeat_interval=10))
+
+        self.assertEqual(frames, [': keep-alive\n\n'])
+
+    def test_pipeline_disconnect_checks_persisted_job_state(self):
+        with open(os.path.join(ROOT, 'index.html'), 'r', encoding='utf-8') as handle:
+            frontend = handle.read()
+
+        self.assertIn("es.onerror=()=>recoverPipelineConnection()", frontend)
+        self.assertIn("await pollProjectSnapshot(currentPid)", frontend)
+        self.assertIn("后台任务仍在运行，页面将自动同步已完成结果", frontend)
+
     @patch.object(factory, 'find_ffmpeg', return_value='ffmpeg.exe')
     @patch.object(factory, 'comfy_check', return_value=True)
     @patch.object(factory.requests, 'get')
