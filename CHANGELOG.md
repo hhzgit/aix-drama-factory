@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Kept long-running pipeline progress streams alive through quiet video-generation phases and made the Web UI verify the persisted background job before offering checkpoint resume after a connection interruption.
+
 ## 2.0.0-dev.12 - 2026-09-14
 
 - Added a Web model selector that scans local GGUF language models, exact MiniMax H3 FL2VA/REF2VA models exposed by ComfyUI, and image models supported by installed T2I workflow adapters.

@@ -2672,10 +2672,38 @@ def initialize_item_states(proj, script):
     return states
 
 # ============================== SSE 工具 ==============================
+SSE_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
+
 def sse(event, data):
     if event == 'error':
         event = 'pipeline_error'
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def sse_comment(comment='keep-alive'):
+    """Return an SSE comment frame that keeps idle proxy connections open."""
+    safe_comment = str(comment).replace('\r', ' ').replace('\n', ' ')
+    return f": {safe_comment}\n\n"
+
+
+def stream_sse_queue(worker, queue, poll_interval=0.3,
+                     heartbeat_interval=SSE_HEARTBEAT_INTERVAL_SECONDS):
+    """Yield worker events and periodic heartbeats during quiet generation phases."""
+    last_emit = time.monotonic()
+    while True:
+        if queue:
+            yield queue.pop(0)
+            last_emit = time.monotonic()
+        elif not worker.is_alive():
+            break
+        elif time.monotonic() - last_emit >= heartbeat_interval:
+            yield sse_comment()
+            last_emit = time.monotonic()
+        else:
+            time.sleep(poll_interval)
+    while queue:
+        yield queue.pop(0)
 
 # ============================== 主管线 ==============================
 def build_script_prompt(settings=None):
@@ -4143,15 +4171,7 @@ def api_pipeline_run():
             yield sse('end', {})
             return
         yield sse('start', {"pid": pid})
-        while True:
-            if queue:
-                yield queue.pop(0)
-            elif not t.is_alive():
-                break
-            else:
-                time.sleep(0.3)
-        while queue:
-            yield queue.pop(0)
+        yield from stream_sse_queue(t, queue)
     return Response(stream(), mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no', 'Connection': 'keep-alive'})
 

@@ -479,7 +479,7 @@
 <script>
 const STAGES=[{n:1,name:'剧本解析',icon:'📝'},{n:2,name:'资产生成',icon:'🎨'},{n:3,name:'片段视频',icon:'🎥'},{n:4,name:'合成成片',icon:'🏆'}];
 const STAGE_RANGE={1:[0,15],2:[15,40],3:[40,95],4:[95,100]};
-let currentPid=null, es=null, SHOT_DATA={}, pipelineStartedAt=0, progressTimer=null, pipelineEnded=false, pipelineShotTotal=0, projectPollTimer=null, polledAssets={}, polledShots={}, lastProductionErrorToken='';
+let currentPid=null, es=null, SHOT_DATA={}, pipelineStartedAt=0, progressTimer=null, pipelineEnded=false, pipelineRecoveryInFlight=false, pipelineShotTotal=0, projectPollTimer=null, polledAssets={}, polledShots={}, lastProductionErrorToken='';
 let currentProductionJob=null, stopRequestInFlight=false;
 const LAST_PROJECT_KEY='aix-current-project';
 let mainInputMode=localStorage.getItem('main_h3_input_mode')==='h3_prompt'?'h3_prompt':'story';
@@ -600,7 +600,7 @@ function stageProgress(stage,done=0,total=0){
   return range[0]+(range[1]-range[0])*ratio;
 }
 function startProgressClock(){
-  pipelineStartedAt=Date.now();pipelineEnded=false;pipelineShotTotal=0;
+  pipelineStartedAt=Date.now();pipelineEnded=false;pipelineRecoveryInFlight=false;pipelineShotTotal=0;
   if(progressTimer)clearInterval(progressTimer);
   $('progress-elapsed').textContent='00:00';
   progressTimer=setInterval(()=>{$('progress-elapsed').textContent=formatElapsed((Date.now()-pipelineStartedAt)/1000);},1000);
@@ -965,9 +965,29 @@ function runPipeline(continuePid){
   es.addEventListener('final',e=>{const d=JSON.parse(e.data);setProductionProgress(100,'制作完成','成片已生成');showFinal(d);});
   es.addEventListener('pipeline_error',e=>{const d=JSON.parse(e.data);pipelineEnded=true;setStage(d.stage||1,'stage-err');setProductionProgress(STAGE_RANGE[d.stage]?.[0]||0,'生成失败',d.msg);log(`❌ ${d.msg}`,'text-red-400');endRun();});
   es.addEventListener('end',e=>{pipelineEnded=true;endRun();});
-  es.onerror=()=>{if(!pipelineEnded&&!['stopping','stopped'].includes(currentProductionJob?.status)){log('进度连接中断，请检查服务状态','text-red-400');setProductionProgress(parseInt($('progress-percent').textContent)||0,'连接中断','请检查下方日志');}endRun();};
+  es.onerror=()=>recoverPipelineConnection();
 }
 function endRun(){if(es){es.close();es=null;}stopProgressClock();renderProductionJobState(currentProductionJob,currentPrepProject||{});setGuidedFlow(guidedFlow);refreshStatus();if(currentPid)startProjectPolling(currentPid);}
+async function recoverPipelineConnection(){
+  if(pipelineEnded||pipelineRecoveryInFlight)return;
+  pipelineRecoveryInFlight=true;pipelineEnded=true;
+  log('进度连接中断，正在检查后台任务状态','gold');
+  setProductionProgress(parseInt($('progress-percent').textContent)||0,'连接中断','正在检查后台任务状态');
+  if(es){es.close();es=null;}stopProgressClock();
+  const synced=currentPid?await pollProjectSnapshot(currentPid):false;
+  if(currentPid)startProjectPolling(currentPid,false);
+  const status=currentProductionJob?.status||'';
+  if(synced&&['queued','running','retrying','merging','stopping'].includes(status)){
+    log('后台任务仍在运行，页面将自动同步已完成结果','text-green-400');
+    setProductionProgress(parseInt($('progress-percent').textContent)||0,'后台任务仍在运行',currentProductionJob?.message||'页面正在同步进度');
+  }else if(!synced){
+    log('无法读取后台任务状态，请检查 AIX 服务后再从断点继续','text-red-400');
+    setProductionProgress(parseInt($('progress-percent').textContent)||0,'连接中断','无法读取后台任务状态');
+  }else if(!['failed','done','stopped'].includes(status)){
+    log('后台任务已结束，可从已保存的断点继续','gold');
+  }
+  renderProductionJobState(currentProductionJob,currentPrepProject||{});setGuidedFlow(guidedFlow);refreshStatus();pipelineRecoveryInFlight=false;
+}
 function resumeCurrentProject(){if(!currentPid)return;log(`从断点继续项目: ${currentPid}`,'gold');runPipeline(currentPid);}
 
 function renderScript(s){
@@ -1312,15 +1332,16 @@ function startProjectPolling(pid,immediate=true){
   projectPollTimer=setInterval(()=>pollProjectSnapshot(pid),5000);
 }
 async function pollProjectSnapshot(pid){
-  if(currentPid!==pid)return;
+  if(currentPid!==pid)return false;
   try{
-    const r=await(await fetch('/api/project/'+pid+'?t='+Date.now(),{cache:'no-store'})).json();if(!r.ok)return;
+    const response=await fetch('/api/project/'+pid+'?t='+Date.now(),{cache:'no-store'});if(!response.ok)return false;
+    const r=await response.json();if(!r.ok)return false;
     const p=r.project,totalAssets=(p.script?.characters?.length||0)+(p.script?.scenes?.length||0)+(p.script?.props?.length||0);
     currentPrepProject=p;renderProductionJobState(p.production_job,p);
     renderItemStates(p.item_states||{});
     (p.assets||[]).forEach(a=>{const token=a.key+'|'+a.url;if(!polledAssets[token]){polledAssets[token]=1;const kind=a.kind==='character'||a.kind==='char'?'character':(a.kind==='prop'?'prop':'scene');addAssetCard({type:kind,name:a.key.replace(/^(char|scene|prop)_/,''),url:a.url+'?t='+Date.now(),cached:true});}});
     (p.shots||[]).forEach(sh=>{const token=sh.index+'|'+sh.video_url;if(!polledShots[token]){polledShots[token]=1;SHOT_DATA[sh.index]=sh;addShotCard(sh);log(`已同步片段 ${sh.segment_id||sh.index}`,'text-green-400');}});
-    if(p.final){setProductionProgress(100,'制作完成','成片已保存');showFinal({video_url:p.final,title:p.title});if(projectPollTimer){clearInterval(projectPollTimer);projectPollTimer=null;}return;}
+    if(p.final){setProductionProgress(100,'制作完成','成片已保存');showFinal({video_url:p.final,title:p.title});if(projectPollTimer){clearInterval(projectPollTimer);projectPollTimer=null;}return true;}
     const jobBusy=['queued','running','retrying','merging','stopping'].includes(p.production_job?.status);
     $('btn-resume').classList.toggle('hidden',!!es||jobBusy||!p.script?.shots?.length);
     if(p.production_job?.status==='failed'){
@@ -1331,7 +1352,8 @@ async function pollProjectSnapshot(pid){
     else if(p.production_job?.status==='merging')setProductionProgress(96,'正在合并成片',p.production_job.message||'请稍候');
     else if((p.shots||[]).length){setProductionProgress(stageProgress(3,p.shots.length,p.script?.shots?.length||p.shots.length),'同步后台生成结果',`已保存片段 ${p.shots.length} / ${p.script?.shots?.length||'?'}`);}
     else if(totalAssets){setProductionProgress(stageProgress(2,(p.assets||[]).length,totalAssets),'同步后台生成结果',`已保存资产 ${(p.assets||[]).length} / ${totalAssets}`);}
-  }catch(e){}
+    return true;
+  }catch(e){return false;}
 }
 
 // ---------- 单镜头生成器 ----------
